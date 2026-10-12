@@ -242,6 +242,81 @@ exclusive_down() {
   log "$sta is a station again, but didn't reconnect to $uuid"
 }
 
+# ----------------------------------------------------------------------- park
+
+# Experimental ($CONF/park-freq, patched iwlmvm): hold the radio on another
+# channel through the P2P Device while the station stays associated, so AWDL
+# can follow an iPhone that moves to 149 to receive. Back-to-back
+# remain-on-channel periods of PARK_MS, with PARK_GAP_MS at home between them
+# for the station. The firmware passes up what it hears there, which the
+# station's own off-channel periods don't, and with awdl_share bit 32 sends
+# what the monitor injects through the P2P Device while it's there.
+PARK_MS=400
+PARK_GAP_MS=40
+
+p2p_wdev() {  # PHY
+  iw dev 2>/dev/null | awk -v phy="${1#phy}" '
+    /^phy#/ { p = substr($1, 5) } /wdev/ { w = $2 }
+    /type P2P-device/ && p == phy { print w; exit }'
+}
+
+park_loop() {  # WDEV FREQ
+  local gap
+  gap=$(awk -v g="$PARK_GAP_MS" 'BEGIN { printf "%.3f", g / 1000 }')
+  while true; do
+    iw wdev "$1" roc start "$2" "$PARK_MS" >/dev/null 2>&1 || sleep 0.5
+    sleep "$(awk -v d="$PARK_MS" -v g="$gap" 'BEGIN { printf "%.3f", d / 1000 + g }')"
+  done
+}
+
+# Follow peers between home and the park channel: OWL logs each peer's
+# channel sequence as it changes. An iPhone that's idle keeps most of its
+# slots on its own network's channel (ours); one that engages (to receive)
+# moves most of them to 149, and one browsing for AirDrop keeps a slot or
+# two of each. Park there while any peer gives it more slots than home, and
+# tell OWL (-C, SIGUSR2) where we are.
+
+follow_loop() {  # WDEV FREQ HOME_CHAN PARK_CHAN
+  local wdev=$1 freq=$2 home=$3 away=$4 park_pid= line peer seq want target cur=home
+  declare -A a h
+  echo "$home" > "$RUN/chan"
+  trap '[ -n "$park_pid" ] && kill "$park_pid" 2>/dev/null; exit 0' TERM INT
+  tail -n0 -F "$OWL_LOG" 2>/dev/null | while read -r line; do
+    case "$line" in
+      *"changed channel sequence to "*)
+        peer=$(sed -E 's/.*peer ([0-9a-f:]+) .*/\1/' <<< "$line")
+        seq=${line##*sequence to }
+        a[$peer]=$(tr ',' '\n' <<< "$seq" | grep -cx "$away")
+        h[$peer]=$(tr ',' '\n' <<< "$seq" | grep -cx "$home") ;;
+      *"remove peer "*)
+        peer=$(sed -E 's/.*remove peer ([0-9a-f:]+).*/\1/' <<< "$line")
+        unset "a[$peer]" "h[$peer]" ;;
+      *) continue ;;
+    esac
+    want=home
+    # $RUN/follow-peer, when it names one, is the only peer that counts:
+    # other Apple devices around keep their own schedules.
+    target=$(cat "$RUN/follow-peer" 2>/dev/null)
+    for peer in "${!a[@]}"; do
+      [ -n "$target" ] && [ "$peer" != "$target" ] && continue
+      [ "${a[$peer]}" -gt "${h[$peer]:-0}" ] && want=away
+    done
+    [ "$want" = "$cur" ] && continue
+    cur=$want
+    if [ "$want" = away ]; then
+      park_loop "$wdev" "$freq" &
+      park_pid=$!
+      echo "$away" > "$RUN/chan"
+    else
+      [ -n "$park_pid" ] && kill "$park_pid" 2>/dev/null
+      park_pid=
+      echo "$home" > "$RUN/chan"
+    fi
+    pkill -USR2 -f "^$OWL_BIN " 2>/dev/null
+    log "follow: now on ch$(cat "$RUN/chan")"
+  done
+}
+
 # --------------------------------------------------------------------- status
 
 visible() {
@@ -341,6 +416,8 @@ cmd_stop() {
   # The supervisor calls `stop expired` itself; don't kill the caller.
   [ -n "$sup" ] && [ "$sup" != "$$" ] && [ "$sup" != "${PPID:-}" ] && kill "$sup" 2>/dev/null
   pkill -f -- "$LIB/awdl-airdrop-adv.py" 2>/dev/null
+  alive "$(pid_of park)" __follow && kill -- -"$(pid_of park)" 2>/dev/null
+  rm -f "$RUN/park.pid"
   alive "$(pid_of owl)" "$OWL_BIN" && kill "$(pid_of owl)" 2>/dev/null
   pkill -f "^$OWL_BIN " 2>/dev/null
   ip link set "$MON" down 2>/dev/null
@@ -401,7 +478,7 @@ supervise() {
 
 cmd_start() {
   local secs=${1:-} sta drv phy gw ap freqs chan stamac monmac mt76 _
-  local owl_extra=() strategy=intersect
+  local owl_extra=() strategy=intersect pt
   [[ "$secs" =~ ^[0-9]+$ ]] || die "usage: omdrop-discoverable start <seconds>" 2
   need_root
   mkdir -p "$RUN"
@@ -458,8 +535,25 @@ cmd_start() {
   # cell on one of AWDL's own.
   chan=$(freq_chan "${ap:-0}")
   [ -n "$chan" ] || die "your Wi-Fi network is on ${ap:-an unknown} MHz, which AirDrop can't share. Use a 2.4 or 5 GHz network." 3
+  local park park_wdev share_on=$AWDL_SHARE_ON
+  park=$(knob park-freq)
   if [ "$PROF_MODE" = shared ] && [ -w "$AWDL_SHARE" ] && [ "$drv" = iwlwifi ]; then
-    echo "$AWDL_SHARE_ON" > "$AWDL_SHARE"
+    if [[ "$park" =~ ^[0-9]+$ ]] && [ -n "$(freq_chan "$park")" ]; then
+      park_wdev=$(p2p_wdev "$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")")
+      if [ -n "$park_wdev" ]; then
+        # 32: send through the P2P Device while it's parked. Not 64 or 128
+        # (its filter): the AX210's firmware asserts (0xFCB) with either.
+        # Restarted after the bits are set, so its MAC context is fresh.
+        share_on=$((AWDL_SHARE_ON | 32))
+        echo "$share_on" > "$AWDL_SHARE"
+        iw wdev "$park_wdev" p2p stop 2>/dev/null
+        iw wdev "$park_wdev" p2p start 2>/dev/null
+        owl_extra+=(-C "$RUN/chan")
+      else
+        log "park-freq set, but no P2P Device to park with"
+      fi
+    fi
+    echo "$share_on" > "$AWDL_SHARE"
     echo 1 > "$RUN/awdl_share"
   fi
   stamac=$(cat "/sys/class/net/$sta/address")
@@ -495,6 +589,19 @@ cmd_start() {
   # that off (owl -f): a desktop's card hears a phone across the room at
   # -75 dBm and talks to it fine.
   [ "$(knob rssi-filter)" = 0 ] && owl_extra+=(-f)
+  # $CONF/peer-timeout: seconds OWL keeps a silent peer (owl -T, default 5).
+  # Receiving, an iPhone moves most of its sequence to 149 and can be quiet
+  # on a shared 36 for longer than that while it still listens there.
+  pt=$(knob peer-timeout)
+  [[ "$pt" =~ ^[0-9]+$ ]] && [ "$pt" -gt 0 ] && owl_extra+=(-T "$pt")
+  # $CONF/fixed-radio, shared mode: "noack" or "ack" runs OWL with -F, which
+  # advertises every peer's slots on our channel rather than the sync
+  # master's alone, and sends to a peer whenever it is on our channel; the
+  # master is often another device. "ack" adds -K, keeping ACKs and retries.
+  case "$PROF_MODE:$(knob fixed-radio)" in
+    shared:noack) owl_extra+=(-F) ;;
+    shared:ack) owl_extra+=(-F -K) ;;
+  esac
   if [ "$PROF_MODE" = exclusive ]; then
     owl_extra+=(-F -E)
     strategy=pin
@@ -512,6 +619,11 @@ cmd_start() {
   if [ "$secs" -gt 0 ]; then echo $(( $(date +%s) + secs )) > "$RUN/until"; else echo 0 > "$RUN/until"; fi
   # 9>&-: children must not inherit the lock, or the long-lived ones would hold
   # it for the whole window and the next `stop` would wait forever.
+  if [ -n "${park_wdev:-}" ]; then
+    setsid "$SELF" __follow "$park_wdev" "$park" "$chan" "$(freq_chan "$park")" > /dev/null 2>&1 < /dev/null 9>&- &
+    echo $! > "$RUN/park.pid"
+    log "following peers between ch$chan and $park MHz through P2P Device $park_wdev"
+  fi
   setsid "$OWL_BIN" -i "$MON" -c "$chan" -N -S "$strategy" "${owl_extra[@]}" -v > "$OWL_LOG" 2>&1 < /dev/null 9>&- &
   echo $! > "$RUN/owl.pid"
   # 50 ms polls: OWL creates it in well under a second, and 0.5 s steps cost up to 0.5 s.
@@ -559,5 +671,7 @@ case "${1:-}" in
   peers)  cmd_peers ;;
   probe)  shift; cmd_probe "$@" ;;
   __supervise) supervise ;;
+  __park) shift; park_loop "$@" ;;
+  __follow) shift; follow_loop "$@" ;;
   *) die "usage: omdrop-discoverable start <seconds> | stop | status [--json] | peers | probe [--json]" 2 ;;
 esac

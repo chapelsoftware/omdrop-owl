@@ -1,0 +1,69 @@
+diff --git i/daemon/owl.c w/daemon/owl.c
+index f982541..2f0861b 100644
+--- i/daemon/owl.c
++++ w/daemon/owl.c
+@@ -93,6 +93,7 @@ int main(int argc, char *argv[]) {
+ 	int filter_rssi = 1;
+ 	int peer_timeout_s = 0;
+ 	int fixed_radio = 0;
++	int fixed_radio_ack = 0;
+ 	int metric_first = 0;
+ 	int no_monitor_mode = 0;
+ 	enum awdl_chanseq_strategy strategy = AWDL_CHANSEQ_VERBATIM;
+@@ -107,7 +108,7 @@ int main(int argc, char *argv[]) {
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FET:")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FET:K")) != -1) {
+ 		switch (c) {
+ 			case 'm': {
+ 				/* Our AWDL address, instead of the monitor interface's MAC. On
+@@ -165,6 +166,11 @@ int main(int argc, char *argv[]) {
+ 			case 'D':
+ 				daemon = 1;
+ 				break;
++			case 'K':
++				/* With -F, still expect ACKs and retry unicast: in shared
++				 * mode the station vif beside the monitor ACKs for us. */
++				fixed_radio_ack = 1;
++				break;
+ 			case 'T':
+ 				/* Seconds without a frame before a peer is dropped
+ 				 * (default 5). A peer we share only part of its
+@@ -296,6 +302,7 @@ int main(int argc, char *argv[]) {
+ 	state.awdl_state.channel.strategy = strategy;
+ 	state.awdl_state.channel.widen_max = widen_max;
+ 	state.awdl_state.channel.fixed_radio = fixed_radio;
++	state.awdl_state.channel.fixed_radio_ack = fixed_radio_ack;
+ 	state.awdl_state.election.metric_first = metric_first;
+ 	if (metric_first)
+ 		log_info("election: by metric, then counter");
+diff --git i/src/channel.h w/src/channel.h
+index e49fc16..832e4c1 100644
+--- i/src/channel.h
++++ w/src/channel.h
+@@ -141,6 +141,9 @@ struct awdl_channel_state {
+ 	 * else) and nobody chose that channel to suit the peers. See
+ 	 * awdl_same_channel_as_peer() and awdl_is_multicast_eaw(). */
+ 	uint8_t fixed_radio;
++	/* -K: keep ACKs and retries for unicast under -F, for a radio that
++	 * shares its channel with a station that ACKs for it */
++	uint8_t fixed_radio_ack;
+ };
+ 
+ void awdl_chanseq_init(struct awdl_chan *seq);
+diff --git i/src/tx.c w/src/tx.c
+index 46a4cf3..70756d3 100644
+--- i/src/tx.c
++++ w/src/tx.c
+@@ -472,7 +472,8 @@ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const
+ 	 * every frame queued behind it until the peer has long gone; a transfer then
+ 	 * stalls on "Waiting". Sent once, without an ACK, a lost frame costs a TCP
+ 	 * retransmission instead. Multicast is never ACKed anyway. */
+-	int noack = state->channel.fixed_radio && !(dst->ether_addr_octet[0] & 1);
++	int noack = state->channel.fixed_radio && !state->channel.fixed_radio_ack &&
++	            !(dst->ether_addr_octet[0] & 1);
+ 
+ 	ptr += init_radiotap_header(ptr, &awdl_data_tx_rate, noack);
+ 	ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);

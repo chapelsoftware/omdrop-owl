@@ -24,6 +24,12 @@
 #                           it (tests/owl_amsdu.c)
 #   owl-09-mif-padding.patch  accept up to three zero bytes after a MIF's last
 #                           TLV, which some iPhones send
+#   owl-10-peer-timeout.patch  -T SECONDS: how long a silent peer is kept
+#                           (default 5)
+#   owl-11-fixed-radio-ack.patch  -K: with -F, unicast still expects an ACK
+#                           and is retried (shared mode, where the station ACKs)
+#   owl-12-retune.patch     -C FILE: reread our channel from FILE on SIGUSR2,
+#                           to follow a peer while the radio is moved for us
 # Applied in name order: each is a diff against the tree with the previous ones.
 set -eu
 

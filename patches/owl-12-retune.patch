@@ -1,0 +1,93 @@
+diff --git i/daemon/owl.c w/daemon/owl.c
+index 2f0861b..87e2284 100644
+--- i/daemon/owl.c
++++ w/daemon/owl.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <stdint.h>
++#include <stdio.h>
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <signal.h>
+@@ -83,11 +84,43 @@ static void daemonize() {
+ 	openlog("owl", LOG_PID, LOG_DAEMON);
+ }
+ 
++static const char *owl_chan_file;
++
++/* -C: our channel, reread on SIGUSR2. With -F it is where we are in every
++ * slot: what the sequence offers peers and what the unicast gate opens on. */
++static void retune_cb(struct ev_loop *loop, ev_signal *w, int revents) {
++	struct daemon_state *state = w->data;
++	FILE *f = fopen(owl_chan_file, "r");
++	int c = 0;
++
++	(void) loop;
++	(void) revents;
++	if (!f || fscanf(f, "%d", &c) != 1) {
++		if (f)
++			fclose(f);
++		log_warn("retune: cannot read a channel from %s", owl_chan_file);
++		return;
++	}
++	fclose(f);
++	switch (c) {
++		case 6: state->awdl_state.channel.master = CHAN_OPCLASS_6; break;
++		case 36: state->awdl_state.channel.master = CHAN_OPCLASS_36; break;
++		case 44: state->awdl_state.channel.master = CHAN_OPCLASS_44; break;
++		case 149: state->awdl_state.channel.master = CHAN_OPCLASS_149; break;
++		default:
++			log_warn("retune: unsupported channel %d", c);
++			return;
++	}
++	log_info("retune: our channel is now %d", c);
++}
++
+ int main(int argc, char *argv[]) {
+ 	int c;
+ 	int daemon = 0;
+ 	int dump = 0;
+ 	int chan_num = 6;
++	const char *chan_file = NULL;
++	static ev_signal retune;
+ 	struct awdl_chan chan;
+ 	int log_level = LOG_INFO;
+ 	int filter_rssi = 1;
+@@ -108,7 +141,7 @@ int main(int argc, char *argv[]) {
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FET:K")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FET:KC:")) != -1) {
+ 		switch (c) {
+ 			case 'm': {
+ 				/* Our AWDL address, instead of the monitor interface's MAC. On
+@@ -166,6 +199,12 @@ int main(int argc, char *argv[]) {
+ 			case 'D':
+ 				daemon = 1;
+ 				break;
++			case 'C':
++				/* On SIGUSR2, read our channel (6, 36, 44 or 149) from
++				 * this file: to follow a peer between channels while
++				 * something else moves the radio. */
++				chan_file = optarg;
++				break;
+ 			case 'K':
+ 				/* With -F, still expect ACKs and retry unicast: in shared
+ 				 * mode the station vif beside the monitor ACKs for us. */
+@@ -330,6 +369,14 @@ int main(int argc, char *argv[]) {
+ 
+ 	awdl_schedule(loop, &state);
+ 
++	if (chan_file) {
++		ev_signal_init(&retune, retune_cb, SIGUSR2);
++		retune.data = &state;
++		owl_chan_file = chan_file;
++		ev_signal_start(loop, &retune);
++		log_info("channel follows %s on SIGUSR2", chan_file);
++	}
++
+ 	ev_run(loop, 0);
+ 
+ 	awdl_free(&state);

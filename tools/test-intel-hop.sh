@@ -4,7 +4,7 @@
 # again and again, and count the AWDL action frames a monitor beside it hears
 # there. Hold an iPhone nearby with the share sheet open (AirDrop browsing).
 #
-#   sudo tools/test-intel-hop.sh [FREQ [DWELL_MS [SECONDS]]]
+#   sudo [ROC_WDEV=0x...] tools/test-intel-hop.sh [FREQ [DWELL_MS [SECONDS]]]
 #
 # FREQ defaults to 5745 (channel 149), DWELL_MS to 200, SECONDS to 20.
 # Needs the patched iwlmvm (kernel/), run with awdl_share=6.
@@ -23,7 +23,7 @@ mac=$(cat "/sys/class/net/$sta/address")
 gw=$(ip -4 route show default dev "$sta" | awk '{print $3; exit}')
 home=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
 echo "station $sta on $home MHz; hopping to $FREQ MHz for ${DWELL} ms at a time, ${SECS} s"
-[ -e /sys/module/iwlmvm/parameters/awdl_share ] && echo 6 > /sys/module/iwlmvm/parameters/awdl_share
+[ -e /sys/module/iwlmvm/parameters/awdl_share ] && echo "${AWDL_SHARE:-6}" > /sys/module/iwlmvm/parameters/awdl_share
 
 iw dev "$MON" del 2>/dev/null
 iw phy "$phy" interface add "$MON" type monitor || exit 1
@@ -37,7 +37,10 @@ tcp=$!
 mark=$(date '+%Y-%m-%d %H:%M:%S')
 end=$((SECONDS + SECS)); n=0; fail=0
 while [ $SECONDS -lt $end ]; do
-  if iw dev "$sta" offchannel "$FREQ" "$DWELL" 2>/dev/null; then n=$((n + 1)); else fail=$((fail + 1)); fi
+  if [ -n "${ROC_WDEV:-}" ]; then
+    # Through the P2P device (iw wdev IDX p2p start first), not the station.
+    iw wdev "$ROC_WDEV" roc start "$FREQ" "$DWELL" >/dev/null 2>&1 && n=$((n + 1)) || fail=$((fail + 1))
+  elif iw dev "$sta" offchannel "$FREQ" "$DWELL" 2>/dev/null; then n=$((n + 1)); else fail=$((fail + 1)); fi
   sleep "$(awk -v d="$DWELL" 'BEGIN { printf "%.3f", (d + 50) / 1000 }')"
 done
 wait "$tcp"

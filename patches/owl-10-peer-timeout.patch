@@ -1,0 +1,50 @@
+diff --git i/daemon/owl.c w/daemon/owl.c
+index d65cd29..f982541 100644
+--- i/daemon/owl.c
++++ w/daemon/owl.c
+@@ -91,6 +91,7 @@ int main(int argc, char *argv[]) {
+ 	struct awdl_chan chan;
+ 	int log_level = LOG_INFO;
+ 	int filter_rssi = 1;
++	int peer_timeout_s = 0;
+ 	int fixed_radio = 0;
+ 	int metric_first = 0;
+ 	int no_monitor_mode = 0;
+@@ -106,7 +107,7 @@ int main(int argc, char *argv[]) {
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FE")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FET:")) != -1) {
+ 		switch (c) {
+ 			case 'm': {
+ 				/* Our AWDL address, instead of the monitor interface's MAC. On
+@@ -164,6 +165,17 @@ int main(int argc, char *argv[]) {
+ 			case 'D':
+ 				daemon = 1;
+ 				break;
++			case 'T':
++				/* Seconds without a frame before a peer is dropped
++				 * (default 5). A peer we share only part of its
++				 * sequence with can go quiet on our channel for longer
++				 * while it still receives there. */
++				peer_timeout_s = atoi(optarg);
++				if (peer_timeout_s < 1) {
++					fprintf(stderr, "-T takes a number of seconds, not '%s'\n", optarg);
++					return EXIT_FAILURE;
++				}
++				break;
+ 			case 'c':
+ 				chan_num = atoi(optarg);
+ 				break;
+@@ -277,6 +289,10 @@ int main(int argc, char *argv[]) {
+ 		return EXIT_FAILURE;
+ 	}
+ 	state.awdl_state.filter_rssi = filter_rssi;
++	if (peer_timeout_s) {
++		state.awdl_state.peers.timeout = (uint64_t) peer_timeout_s * 1000000;
++		log_info("peer timeout: %d s", peer_timeout_s);
++	}
+ 	state.awdl_state.channel.strategy = strategy;
+ 	state.awdl_state.channel.widen_max = widen_max;
+ 	state.awdl_state.channel.fixed_radio = fixed_radio;
