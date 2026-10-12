@@ -1,0 +1,26 @@
+diff --git i/src/rx.c w/src/rx.c
+index 3e6af09..314834d 100644
+--- i/src/rx.c
++++ w/src/rx.c
+@@ -321,6 +321,21 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 		buf_strip(frame, len);
+ 	}
+ 
++	/* Some iPhones end every MIF with two zero bytes after the last TLV
++	 * (measured 2026-10-12: one sender always, another never, so it is the
++	 * sender's, not padding added on receive). Accept up to three zero bytes
++	 * as padding; anything else is still a malformed frame. */
++	if (buf_len(frame) > 0 && buf_len(frame) < 4) {
++		int zero = 1;
++		for (int i = 0; i < buf_len(frame); i++) {
++			uint8_t b;
++			if (read_u8(frame, i, &b) < 0 || b)
++				zero = 0;
++		}
++		if (zero)
++			buf_strip(frame, buf_len(frame));
++	}
++
+ 	if (buf_len(frame) > 0) {
+ 		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
+ 		return RX_UNEXPECTED_FORMAT;

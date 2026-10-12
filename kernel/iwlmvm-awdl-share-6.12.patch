@@ -238,10 +238,27 @@ index a7dbc0a..d4d2e61 100644
   * module init and exit functions
   */
 diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
-index 5f4942f..fe7da55 100644
+index 5f4942f..d496a15 100644
 --- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
 +++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
-@@ -822,6 +822,15 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mvm *mvm, struct sk_buff *skb)
+@@ -344,6 +344,16 @@ static u32 iwl_mvm_get_inject_tx_rate(struct iwl_mvm *mvm,
+ 	} else {
+ 		int rate_idx = info->control.rates[0].idx;
+ 
++		/* mac80211's index is into the band's bitrates, which have no
++		 * CCK rates outside 2.4 GHz: remap it into the driver's table as
++		 * iwl_mvm_get_tx_rate() does. Without this, 12 Mbit/s injected
++		 * on 5 GHz (index 2) went out as CCK 5.5 Mbit/s.
++		 */
++		if (rate_idx >= 0 &&
++		    (info->band != NL80211_BAND_2GHZ ||
++		     (info->flags & IEEE80211_TX_CTL_NO_CCK_RATE)))
++			rate_idx += IWL_FIRST_OFDM_RATE;
++
+ 		result = iwl_mvm_convert_rate_idx(mvm, info, rate_idx);
+ 	}
+ 
+@@ -822,6 +832,15 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mvm *mvm, struct sk_buff *skb)
  			queue = mvm->aux_queue;
  			if (WARN_ON(queue == IWL_MVM_INVALID_QUEUE))
  				return -1;
@@ -257,3 +274,19 @@ index 5f4942f..fe7da55 100644
  		} else if (info.control.vif->type ==
  			   NL80211_IFTYPE_P2P_DEVICE ||
  			   info.control.vif->type == NL80211_IFTYPE_AP ||
+@@ -1717,6 +1736,15 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
+ 
+ 	seq_ctl = le16_to_cpu(tx_resp->seq_ctl);
+ 
++	/* awdl_share: what became of what the monitor injected (rate limited) */
++	if (unlikely(READ_ONCE(mvm->awdl_share_vif)) &&
++	    txq_id == mvm->snif_queue)
++		IWL_ERR_LIMIT(mvm,
++			      "awdl_share: tx status 0x%x tries %d rate 0x%x\n",
++			      status,
++			      tx_resp->failure_frame,
++			      le32_to_cpu(tx_resp->initial_rate));
++
+ 	/* we can free until ssn % q.n_bd not inclusive */
+ 	iwl_trans_reclaim(mvm->trans, txq_id, ssn, &skbs, false);
+ 
