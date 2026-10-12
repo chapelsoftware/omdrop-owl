@@ -491,6 +491,10 @@ cmd_start() {
   # where we are (patches/owl-06-fixed-radio-pin.patch), rather than only the
   # slots the phone already gives it: those move while the phone makes room
   # for us, and the intersection trails them by a tick.
+  # OWL ignores peers it hears below -65 dBm. $CONF/rssi-filter = 0 turns
+  # that off (owl -f): a desktop's card hears a phone across the room at
+  # -75 dBm and talks to it fine.
+  [ "$(knob rssi-filter)" = 0 ] && owl_extra+=(-f)
   if [ "$PROF_MODE" = exclusive ]; then
     owl_extra+=(-F -E)
     strategy=pin
