@@ -5,7 +5,7 @@
 # Needs no root.
 #
 #   sudo apt install build-essential cmake git pkg-config dpkg-dev \
-#     libev-dev libpcap-dev libnl-3-dev libnl-genl-3-dev
+#     libev-dev libpcap-dev libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
 #   tools/build-deb.sh
 #   sudo apt install ./omdrop-owl_*.deb
 set -eu
