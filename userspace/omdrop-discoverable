@@ -34,6 +34,9 @@
 # everything lives at fixed paths: helpers beside this script (/usr/lib/omdrop
 # when packaged), state in $RUN, tunables in $CONF.
 set -uo pipefail
+# iw and ip live in /usr/sbin, which isn't on an unprivileged user's PATH on
+# Debian: probe, status and peers run as the user.
+PATH=$PATH:/usr/sbin:/sbin
 
 SELF=$(readlink -f "$0")
 LIB=$(dirname "$SELF")

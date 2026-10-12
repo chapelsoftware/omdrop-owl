@@ -16,6 +16,7 @@ LIB = Path(__file__).resolve().parent
 RUN = Path('/run/omdrop-owl')
 NET = Path('/sys/class/net')
 OWNED = ('awdlgo0', 'mon0')
+GO_CARDS = {('0x8086', '0x51f0'), ('0x8086', '0x2725')}
 stopping = False
 
 
@@ -54,8 +55,9 @@ def preflight(station):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', station):
         raise RuntimeError('Invalid station interface')
     path = NET / station
-    if ((path / 'device/vendor').read_text().strip(), (path / 'device/device').read_text().strip()) != ('0x8086', '0x51f0'):
-        raise RuntimeError('Connected GO mode currently supports only Intel AX211 8086:51f0')
+    # AX211 (51f0) and AX210 (2725): both offer managed + P2P-GO on two channels
+    if ((path / 'device/vendor').read_text().strip(), (path / 'device/device').read_text().strip()) not in GO_CARDS:
+        raise RuntimeError('Connected GO mode currently supports only Intel AX211 8086:51f0 and AX210 8086:2725')
     phy = (path / 'phy80211').resolve(strict=True).name
     if not re.fullmatch(r'phy[0-9]+', phy):
         raise RuntimeError('Invalid station PHY')
