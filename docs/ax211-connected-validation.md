@@ -2,7 +2,8 @@
 
 Dell XPS 9320, Intel AX211 PCI 8086:51f0, kernel 7.2.8-5-omarchy-bore,
 firmware 89.d2579d43.0. Stock driver throughout. Managed Wi-Fi stayed on
-channel 36; the secondary GO used channel 6. No second adapter was used.
+channel 36; the secondary GO used channel 6. No second adapter was used. The Apple peer was an iPhone 16 Pro on iOS
+26.6.2 (owner-reported); both sides used Everyone visibility.
 
 ## Installed omdrop path
 
