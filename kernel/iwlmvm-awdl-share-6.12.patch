@@ -53,24 +53,27 @@ index 3fd257f..0edd913 100644
  
  static void iwl_mvm_config_iface_filter(struct ieee80211_hw *hw,
 diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
-index bb78510..a93a2de 100644
+index bb78510..50f2910 100644
 --- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
 +++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
-@@ -149,6 +149,12 @@ static int iwl_mvm_mld_mac_ctxt_cmd_sta(struct iwl_mvm *mvm,
+@@ -149,6 +149,15 @@ static int iwl_mvm_mld_mac_ctxt_cmd_sta(struct iwl_mvm *mvm,
  	if (vif->probe_req_reg && vif->cfg.assoc && vif->p2p)
  		cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_ACCEPT_PROBE_REQ);
  
 +	/* awdl_share: pass other BSSs' frames up to the monitor */
-+	if (mvm->awdl_share_vif == vif)
-+		cmd.filter_flags |=
-+			cpu_to_le32(MAC_CFG_FILTER_PROMISC |
-+				    MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT);
++	if (mvm->awdl_share_vif == vif) {
++		if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_PROMISC)
++			cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_PROMISC);
++		if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_MGMT)
++			cmd.filter_flags |=
++				cpu_to_le32(MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT);
++	}
 +
  	if (vif->bss_conf.he_support && !iwlwifi_mod_params.disable_11ax)
  		cmd.client.data_policy |=
  			cpu_to_le16(iwl_mvm_mac_ctxt_cmd_sta_get_twt_policy(mvm, vif));
 diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
-index 04da02b..2459713 100644
+index 04da02b..b62d5da 100644
 --- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
 +++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
 @@ -394,6 +394,81 @@ out:
@@ -139,7 +142,7 @@ index 04da02b..2459713 100644
 +
 +	WRITE_ONCE(mvm->awdl_share_vif, vif);
 +	ret = iwl_mvm_mld_mac_ctxt_changed(mvm, vif, false);
-+	if (!ret)
++	if (!ret && (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_TX))
 +		ret = iwl_mvm_mld_add_snif_sta(mvm, vif, &vif->bss_conf);
 +	if (ret) {
 +		IWL_ERR(mvm, "awdl_share: failed to share %pM (%d)\n",
@@ -174,10 +177,10 @@ index 04da02b..2459713 100644
  			mvmvif->session_prot_connection_loss = false;
  
 diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
-index 7d86d27..35c9474 100644
+index 7d86d27..73e1194 100644
 --- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
 +++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
-@@ -84,9 +84,14 @@ extern const struct ieee80211_ops iwl_mvm_mld_hw_ops;
+@@ -84,9 +84,20 @@ extern const struct ieee80211_ops iwl_mvm_mld_hw_ops;
  /**
   * struct iwl_mvm_mod_params - module parameters for iwlmvm
   * @power_scheme: one of enum iwl_power_scheme
@@ -186,13 +189,19 @@ index 7d86d27..35c9474 100644
 + *	frames injected through the monitor with the station's address are
 + *	sent instead of dropped (AWDL in userspace beside Wi-Fi)
   */
++/* iwlmvm_mod_params.awdl_share bits (0: off) */
++#define IWL_MVM_AWDL_SHARE_PROMISC	BIT(0)
++#define IWL_MVM_AWDL_SHARE_MGMT		BIT(1)
++#define IWL_MVM_AWDL_SHARE_TX		BIT(2)
++#define IWL_MVM_AWDL_SHARE_ALL		(BIT(0) | BIT(1) | BIT(2))
++
  struct iwl_mvm_mod_params {
  	int power_scheme;
-+	bool awdl_share;
++	int awdl_share;
  };
  extern struct iwl_mvm_mod_params iwlmvm_mod_params;
  
-@@ -1333,6 +1338,10 @@ struct iwl_mvm {
+@@ -1333,6 +1344,10 @@ struct iwl_mvm {
  
  	/* does a monitor vif exist (only one can exist hence bool) */
  	bool monitor_on;
@@ -203,7 +212,7 @@ index 7d86d27..35c9474 100644
  	/*
  	 * primary channel position relative to he whole bandwidth,
  	 * in steps of 80 MHz
-@@ -1610,6 +1619,9 @@ static inline bool iwl_mvm_has_new_rx_api(struct iwl_mvm *mvm)
+@@ -1610,6 +1625,9 @@ static inline bool iwl_mvm_has_new_rx_api(struct iwl_mvm *mvm)
  			   IWL_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT);
  }
  
@@ -214,16 +223,16 @@ index 7d86d27..35c9474 100644
  {
  	return fw_has_capa(&fw->ucode_capa,
 diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
-index a7dbc0a..756d810 100644
+index a7dbc0a..d4d2e61 100644
 --- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
 +++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
 @@ -47,6 +47,10 @@ module_param_named(power_scheme, iwlmvm_mod_params.power_scheme, int, 0444);
  MODULE_PARM_DESC(power_scheme,
  		 "power management scheme: 1-active, 2-balanced, 3-low power, default: 2");
  
-+module_param_named(awdl_share, iwlmvm_mod_params.awdl_share, bool, 0644);
++module_param_named(awdl_share, iwlmvm_mod_params.awdl_share, int, 0644);
 +MODULE_PARM_DESC(awdl_share,
-+		 "let a monitor interface inject and receive on an associated station's channel (default: N)");
++		 "let a monitor interface share an associated station's channel: bitmask, 1: pass up data frames of other BSSs, 2: and their management and control frames, 4: send injected frames (default: 0, off)");
 +
  /*
   * module init and exit functions
