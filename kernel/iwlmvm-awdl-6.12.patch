@@ -1,0 +1,500 @@
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index 3fd257f..a6e6673 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -798,6 +798,16 @@ int iwl_mvm_mac_setup_register(struct iwl_mvm *mvm)
+ static void iwl_mvm_tx_skb(struct iwl_mvm *mvm, struct sk_buff *skb,
+ 			   struct ieee80211_sta *sta)
+ {
++	struct ieee80211_vif *vif = IEEE80211_SKB_CB(skb)->control.vif;
++
++	/* awdl_share 512: our GO's ADDBA/DELBA to an AWDL peer */
++	if (unlikely(sta) && vif && vif->type == NL80211_IFTYPE_AP && vif->p2p &&
++	    iwl_mvm_awdl_back(skb, vif->addr)) {
++		struct ieee80211_mgmt *mgmt = (void *)skb->data;
++
++		ether_addr_copy(mgmt->bssid, iwl_mvm_awdl_bssid);
++	}
++
+ 	if (likely(sta)) {
+ 		if (likely(iwl_mvm_tx_skb_sta(mvm, skb, sta) == 0))
+ 			return;
+@@ -839,9 +849,14 @@ void iwl_mvm_mac_tx(struct ieee80211_hw *hw,
+ 	if (ieee80211_is_mgmt(hdr->frame_control))
+ 		sta = NULL;
+ 
+-	/* this shouldn't even happen: just drop */
++	/* this shouldn't even happen: just drop. Except frames injected
++	 * through a monitor sharing the station's channel (awdl_share), which
++	 * carry the station's address and go out through the sniffer station.
++	 */
+ 	if (!sta && info->control.vif->type == NL80211_IFTYPE_STATION &&
+-	    !offchannel)
++	    !offchannel &&
++	    !((info->flags & IEEE80211_TX_CTL_INJECTED) &&
++	      READ_ONCE(mvm->awdl_share_vif) == info->control.vif))
+ 		goto drop;
+ 
+ 	if (tmp_sta && !sta && link_id != IEEE80211_LINK_UNSPECIFIED &&
+@@ -1195,6 +1210,13 @@ static void iwl_mvm_restart_cleanup(struct iwl_mvm *mvm)
+ 
+ 	mvm->rx_ba_sessions = 0;
+ 	mvm->fwrt.dump.conf = FW_DBG_INVALID;
++	/* The firmware forgot the sniffer station; configure_filter re-adds it */
++	if (mvm->awdl_share_vif) {
++		WRITE_ONCE(mvm->awdl_share_vif, NULL);
++		if (mvm->snif_sta.sta_id != IWL_MVM_INVALID_STA)
++			iwl_mvm_dealloc_int_sta(mvm, &mvm->snif_sta);
++		mvm->snif_queue = IWL_MVM_INVALID_QUEUE;
++	}
+ 	mvm->monitor_on = false;
+ #ifdef CONFIG_IWLWIFI_DEBUGFS
+ 	mvm->beacon_inject_active = false;
+@@ -1345,6 +1367,10 @@ static void iwl_mvm_restart_complete(struct iwl_mvm *mvm)
+ 	 * of packets the FW sent out, so we must reconnect.
+ 	 */
+ 	iwl_mvm_teardown_tdls_peers(mvm);
++
++	/* awdl_share was dropped in restart cleanup; share again */
++	if (mvm->mld_api_is_used)
++		iwl_mvm_awdl_share_update(mvm);
+ }
+ 
+ void iwl_mvm_mac_reconfig_complete(struct ieee80211_hw *hw,
+@@ -2117,6 +2143,8 @@ void iwl_mvm_configure_filter(struct ieee80211_hw *hw,
+ 
+ 	guard(mvm)(mvm);
+ 
++	mvm->other_bss_wanted = !!(*total_flags & FIF_OTHER_BSS);
++
+ 	/* replace previous configuration */
+ 	kfree(mvm->mcast_filter_cmd);
+ 	mvm->mcast_filter_cmd = cmd;
+@@ -2132,7 +2160,8 @@ void iwl_mvm_configure_filter(struct ieee80211_hw *hw,
+ 
+ 	iwl_mvm_recalc_multicast(mvm);
+ out:
+-	*total_flags = 0;
++	iwl_mvm_awdl_share_update(mvm);
++	*total_flags = mvm->awdl_share_vif ? FIF_OTHER_BSS | FIF_CONTROL : 0;
+ }
+ 
+ static void iwl_mvm_config_iface_filter(struct ieee80211_hw *hw,
+@@ -3021,7 +3050,13 @@ bool iwl_mvm_start_ap_ibss_common(struct ieee80211_hw *hw,
+ 			return true;
+ 	}
+ 
+-	if (vif->type == NL80211_IFTYPE_AP && !vif->p2p) {
++	/* awdl_share 256: a P2P GO too. omdrop-owl's AWDL rides a GO beside
++	 * the station, and without this the firmware gave the GO's channel
++	 * about a quarter of the time during a transfer.
++	 */
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    (!vif->p2p ||
++	     (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_GO_LL))) {
+ 		iwl_mvm_vif_set_low_latency(mvmvif, true,
+ 					    LOW_LATENCY_VIF_TYPE);
+ 		iwl_mvm_send_low_latency_cmd(mvm, true, mvmvif->id);
+@@ -3191,7 +3226,8 @@ void iwl_mvm_stop_ap_ibss_common(struct iwl_mvm *mvm,
+ 	mvmvif->ap_ibss_active = false;
+ 	mvm->ap_last_beacon_gp2 = 0;
+ 
+-	if (vif->type == NL80211_IFTYPE_AP && !vif->p2p) {
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    (mvmvif->low_latency & LOW_LATENCY_VIF_TYPE)) {
+ 		iwl_mvm_vif_set_low_latency(mvmvif, false,
+ 					    LOW_LATENCY_VIF_TYPE);
+ 		iwl_mvm_send_low_latency_cmd(mvm, false,  mvmvif->id);
+@@ -4830,8 +4866,14 @@ static int iwl_mvm_roc_station(struct iwl_mvm *mvm,
+ 	if (fw_ver == IWL_FW_CMD_VER_UNKNOWN) {
+ 		ret = iwl_mvm_send_aux_roc_cmd(mvm, channel, vif, duration);
+ 	} else if (fw_ver >= 3) {
++		/* awdl_share: listen as P2P discovery does (experimental) */
++		bool p2p = vif == READ_ONCE(mvm->awdl_share_vif) &&
++			   (iwlmvm_mod_params.awdl_share &
++			    IWL_MVM_AWDL_SHARE_ROC_P2P);
++
+ 		ret = iwl_mvm_roc_add_cmd(mvm, channel, vif, duration,
+-					  ROC_ACTIVITY_HOTSPOT);
++					  p2p ? ROC_ACTIVITY_P2P_DISC :
++						ROC_ACTIVITY_HOTSPOT);
+ 	} else {
+ 		ret = -EOPNOTSUPP;
+ 		IWL_ERR(mvm, "ROC command version %d mismatch!\n", fw_ver);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
+index bb78510..2268712 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac.c
+@@ -149,6 +149,15 @@ static int iwl_mvm_mld_mac_ctxt_cmd_sta(struct iwl_mvm *mvm,
+ 	if (vif->probe_req_reg && vif->cfg.assoc && vif->p2p)
+ 		cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_ACCEPT_PROBE_REQ);
+ 
++	/* awdl_share: pass other BSSs' frames up to the monitor */
++	if (mvm->awdl_share_vif == vif) {
++		if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_PROMISC)
++			cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_PROMISC);
++		if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_MGMT)
++			cmd.filter_flags |=
++				cpu_to_le32(MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT);
++	}
++
+ 	if (vif->bss_conf.he_support && !iwlwifi_mod_params.disable_11ax)
+ 		cmd.client.data_policy |=
+ 			cpu_to_le16(iwl_mvm_mac_ctxt_cmd_sta_get_twt_policy(mvm, vif));
+@@ -211,6 +220,15 @@ static int iwl_mvm_mld_mac_ctxt_cmd_p2p_device(struct iwl_mvm *mvm,
+ 	 */
+ 	cmd.filter_flags = cpu_to_le32(MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT);
+ 
++	/* awdl_share: also AWDL's data, unicast to us from a peer we have no
++	 * station for, while parked on another channel (experimental)
++	 */
++	if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_P2P_GRP)
++		cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_ACCEPT_GRP);
++	/* 128: all data; the AX210's firmware asserts (0xFCB) on it */
++	if (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_P2P_PROMISC)
++		cmd.filter_flags |= cpu_to_le32(MAC_CFG_FILTER_PROMISC);
++
+ 	return iwl_mvm_mld_mac_ctxt_send_cmd(mvm, &cmd);
+ }
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
+index 04da02b..b62d5da 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mld-mac80211.c
+@@ -394,6 +394,81 @@ out:
+ 	return ret;
+ }
+ 
++/*
++ * awdl_share: a monitor interface beside an associated station, as OWL runs
++ * AWDL on the station's channel. With the module parameter set and mac80211
++ * asking for other BSSs' frames, the station's MAC context accepts everything
++ * (the firmware otherwise drops AWDL's frames, whose BSSID isn't the AP's),
++ * and a sniffer station on its link carries what the monitor injects with the
++ * station's address: mac80211 sends those through the station vif, where
++ * there's no station entry for the peer to send them from.
++ * Not with a real monitor vif (exclusive use), which owns the sniffer station.
++ */
++static void iwl_mvm_awdl_share_iter(void *data, u8 *mac,
++				    struct ieee80211_vif *vif)
++{
++	struct ieee80211_vif **found = data;
++
++	if (!*found && vif->type == NL80211_IFTYPE_STATION && !vif->p2p &&
++	    vif->cfg.assoc && !ieee80211_vif_is_mld(vif) &&
++	    iwl_mvm_vif_from_mac80211(vif)->uploaded)
++		*found = vif;
++}
++
++void iwl_mvm_awdl_share_release(struct iwl_mvm *mvm, struct ieee80211_vif *vif)
++{
++	lockdep_assert_held(&mvm->mutex);
++
++	if (!vif || mvm->awdl_share_vif != vif)
++		return;
++
++	if (mvm->snif_sta.sta_id != IWL_MVM_INVALID_STA)
++		iwl_mvm_mld_rm_snif_sta(mvm, vif);
++	WRITE_ONCE(mvm->awdl_share_vif, NULL);
++	if (iwl_mvm_vif_from_mac80211(vif)->uploaded)
++		iwl_mvm_mld_mac_ctxt_changed(mvm, vif, false);
++	IWL_INFO(mvm, "awdl_share: off (%pM)\n", vif->addr);
++}
++
++void iwl_mvm_awdl_share_update(struct iwl_mvm *mvm)
++{
++	struct ieee80211_vif *vif = NULL;
++	int ret;
++
++	lockdep_assert_held(&mvm->mutex);
++
++	if (!mvm->mld_api_is_used ||
++	    test_bit(IWL_MVM_STATUS_IN_HW_RESTART, &mvm->status))
++		return;
++
++	if (iwlmvm_mod_params.awdl_share && mvm->other_bss_wanted &&
++	    !mvm->monitor_on)
++		ieee80211_iterate_active_interfaces_mtx(mvm->hw,
++				IEEE80211_IFACE_ITER_NORMAL,
++				iwl_mvm_awdl_share_iter, &vif);
++
++	if (vif == mvm->awdl_share_vif)
++		return;
++
++	iwl_mvm_awdl_share_release(mvm, mvm->awdl_share_vif);
++	if (!vif || WARN_ON(mvm->snif_sta.sta_id != IWL_MVM_INVALID_STA))
++		return;
++
++	WRITE_ONCE(mvm->awdl_share_vif, vif);
++	ret = iwl_mvm_mld_mac_ctxt_changed(mvm, vif, false);
++	if (!ret && (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_TX))
++		ret = iwl_mvm_mld_add_snif_sta(mvm, vif, &vif->bss_conf);
++	if (ret) {
++		IWL_ERR(mvm, "awdl_share: failed to share %pM (%d)\n",
++			vif->addr, ret);
++		WRITE_ONCE(mvm->awdl_share_vif, NULL);
++		iwl_mvm_mld_mac_ctxt_changed(mvm, vif, false);
++		return;
++	}
++	IWL_INFO(mvm, "awdl_share: on (%pM, sniffer sta %d, queue %d)\n",
++		 vif->addr, mvm->snif_sta.sta_id, mvm->snif_queue);
++}
++
+ static int iwl_mvm_mld_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 					  struct ieee80211_vif *vif,
+ 					  struct ieee80211_bss_conf *link_conf,
+@@ -515,6 +590,8 @@ __iwl_mvm_mld_unassign_vif_chanctx(struct iwl_mvm *mvm,
+ 	if (vif->type == NL80211_IFTYPE_MONITOR)
+ 		iwl_mvm_mld_rm_snif_sta(mvm, vif);
+ 
++	iwl_mvm_awdl_share_release(mvm, vif);
++
+ 	if (switching_chanctx)
+ 		return;
+ 	mvmvif->link[link_id]->phy_ctxt = NULL;
+@@ -886,6 +963,8 @@ static void iwl_mvm_mld_vif_cfg_changed_station(struct iwl_mvm *mvm,
+ 	mvmvif->associated = vif->cfg.assoc;
+ 
+ 	if (changes & BSS_CHANGED_ASSOC) {
++		iwl_mvm_awdl_share_update(mvm);
++
+ 		if (vif->cfg.assoc) {
+ 			mvmvif->session_prot_connection_loss = false;
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index 7d86d27..d29fe36 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -84,12 +84,50 @@ extern const struct ieee80211_ops iwl_mvm_mld_hw_ops;
+ /**
+  * struct iwl_mvm_mod_params - module parameters for iwlmvm
+  * @power_scheme: one of enum iwl_power_scheme
++ * @awdl_share: let a monitor interface share an associated station's
++ *	channel: the station's MAC context passes other BSSs' frames up, and
++ *	frames injected through the monitor with the station's address are
++ *	sent instead of dropped (AWDL in userspace beside Wi-Fi)
+  */
++/* iwlmvm_mod_params.awdl_share bits (0: off) */
++#define IWL_MVM_AWDL_SHARE_PROMISC	BIT(0)
++#define IWL_MVM_AWDL_SHARE_MGMT		BIT(1)
++#define IWL_MVM_AWDL_SHARE_TX		BIT(2)
++#define IWL_MVM_AWDL_SHARE_ROC_BCAST	BIT(3)
++#define IWL_MVM_AWDL_SHARE_ROC_P2P	BIT(4)
++#define IWL_MVM_AWDL_SHARE_TX_P2P	BIT(5)
++#define IWL_MVM_AWDL_SHARE_P2P_GRP	BIT(6)
++#define IWL_MVM_AWDL_SHARE_P2P_PROMISC	BIT(7)
++#define IWL_MVM_AWDL_SHARE_GO_LL	BIT(8)
++#define IWL_MVM_AWDL_SHARE_GO_BACK	BIT(9)
++#define IWL_MVM_AWDL_SHARE_ALL		(BIT(0) | BIT(1) | BIT(2))
++
+ struct iwl_mvm_mod_params {
+ 	int power_scheme;
++	int awdl_share;
+ };
+ extern struct iwl_mvm_mod_params iwlmvm_mod_params;
+ 
++/* AWDL's fixed BSSID. With awdl_share 512, block-ack action frames between a
++ * P2P GO and AWDL peers that are its stations swap it for the GO's own BSSID
++ * on the way in (mac80211 drops other BSSs' non-public action frames on an
++ * AP) and back on the way out, so mac80211 negotiates their block-ack
++ * sessions. omdrop-owl runs AWDL over such a GO. */
++static const u8 iwl_mvm_awdl_bssid[ETH_ALEN] __maybe_unused = {
++	0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++static inline bool iwl_mvm_awdl_back(struct sk_buff *skb, const u8 *bssid)
++{
++	struct ieee80211_mgmt *mgmt = (void *)skb->data;
++
++	return (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_GO_BACK) &&
++	       skb->len >= IEEE80211_MIN_ACTION_SIZE + 1 &&
++	       ieee80211_is_action(mgmt->frame_control) &&
++	       mgmt->u.action.category == WLAN_CATEGORY_BACK &&
++	       !is_multicast_ether_addr(mgmt->da) &&
++	       ether_addr_equal(mgmt->bssid, bssid);
++}
++
+ struct iwl_mvm_phy_ctxt {
+ 	u16 id;
+ 	u16 color;
+@@ -1333,6 +1371,10 @@ struct iwl_mvm {
+ 
+ 	/* does a monitor vif exist (only one can exist hence bool) */
+ 	bool monitor_on;
++	/* mac80211 wants other BSSs' frames (a monitor beside a station) */
++	bool other_bss_wanted;
++	/* the station sharing its channel with a monitor (awdl_share) */
++	struct ieee80211_vif *awdl_share_vif;
+ 	/*
+ 	 * primary channel position relative to he whole bandwidth,
+ 	 * in steps of 80 MHz
+@@ -1610,6 +1652,9 @@ static inline bool iwl_mvm_has_new_rx_api(struct iwl_mvm *mvm)
+ 			   IWL_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT);
+ }
+ 
++void iwl_mvm_awdl_share_update(struct iwl_mvm *mvm);
++void iwl_mvm_awdl_share_release(struct iwl_mvm *mvm, struct ieee80211_vif *vif);
++
+ static inline bool iwl_mvm_has_mld_api(const struct iwl_fw *fw)
+ {
+ 	return fw_has_capa(&fw->ucode_capa,
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index a7dbc0a..d4d2e61 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -47,6 +47,10 @@ module_param_named(power_scheme, iwlmvm_mod_params.power_scheme, int, 0444);
+ MODULE_PARM_DESC(power_scheme,
+ 		 "power management scheme: 1-active, 2-balanced, 3-low power, default: 2");
+ 
++module_param_named(awdl_share, iwlmvm_mod_params.awdl_share, int, 0644);
++MODULE_PARM_DESC(awdl_share,
++		 "let a monitor interface share an associated station's channel: bitmask, 1: pass up data frames of other BSSs, 2: and their management and control frames, 4: send injected frames (default: 0, off)");
++
+ /*
+  * module init and exit functions
+  */
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+index 64bd5d1..508d003 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+@@ -243,6 +243,13 @@ static void iwl_mvm_pass_packet_to_mac80211(struct iwl_mvm *mvm,
+ 		return;
+ 	}
+ 
++	/* awdl_share 512: an AWDL peer's ADDBA/DELBA to our GO */
++	if (unlikely(sta) && iwl_mvm_awdl_back(skb, iwl_mvm_awdl_bssid)) {
++		struct ieee80211_mgmt *mgmt = (void *)skb->data;
++
++		ether_addr_copy(mgmt->bssid, mgmt->da);
++	}
++
+ 	ieee80211_rx_napi(mvm->hw, sta, skb, napi);
+ }
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/time-event.c b/drivers/net/wireless/intel/iwlwifi/mvm/time-event.c
+index 17b8ccc..10c8926 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/time-event.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/time-event.c
+@@ -1134,6 +1134,12 @@ int iwl_mvm_roc_add_cmd(struct iwl_mvm *mvm,
+ 
+ 	/* Set the node address */
+ 	memcpy(roc_req.node_addr, vif->addr, ETH_ALEN);
++	/* awdl_share: hear everything on the other channel, not only frames
++	 * to us: AWDL's action frames are broadcast (experimental)
++	 */
++	if (vif == READ_ONCE(mvm->awdl_share_vif) &&
++	    (iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_ROC_BCAST))
++		eth_broadcast_addr(roc_req.node_addr);
+ 
+ 	res = iwl_mvm_send_cmd_pdu(mvm, WIDE_ID(MAC_CONF_GROUP, ROC_CMD),
+ 				   0, sizeof(roc_req), &roc_req);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+index 5f4942f..6e57a90 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+@@ -344,6 +344,16 @@ static u32 iwl_mvm_get_inject_tx_rate(struct iwl_mvm *mvm,
+ 	} else {
+ 		int rate_idx = info->control.rates[0].idx;
+ 
++		/* mac80211's index is into the band's bitrates, which have no
++		 * CCK rates outside 2.4 GHz: remap it into the driver's table as
++		 * iwl_mvm_get_tx_rate() does. Without this, 12 Mbit/s injected
++		 * on 5 GHz (index 2) went out as CCK 5.5 Mbit/s.
++		 */
++		if (rate_idx >= 0 &&
++		    (info->band != NL80211_BAND_2GHZ ||
++		     (info->flags & IEEE80211_TX_CTL_NO_CCK_RATE)))
++			rate_idx += IWL_FIRST_OFDM_RATE;
++
+ 		result = iwl_mvm_convert_rate_idx(mvm, info, rate_idx);
+ 	}
+ 
+@@ -822,6 +832,54 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mvm *mvm, struct sk_buff *skb)
+ 			queue = mvm->aux_queue;
+ 			if (WARN_ON(queue == IWL_MVM_INVALID_QUEUE))
+ 				return -1;
++		} else if (info.control.vif->type == NL80211_IFTYPE_STATION &&
++			   (info.flags & IEEE80211_TX_CTL_INJECTED) &&
++			   READ_ONCE(mvm->awdl_share_vif) == info.control.vif) {
++			/* awdl_share: see iwl_mvm_awdl_share_update() */
++			struct ieee80211_vif *p2p = READ_ONCE(mvm->p2p_device_vif);
++
++			sta_id = mvm->snif_sta.sta_id;
++			queue = mvm->snif_queue;
++			if (net_ratelimit())
++				IWL_INFO(mvm,
++					 "awdl_share: tx route p2p %d bit %d roc_act %d aux_running %d p2p_running %d auxq %d p2pq %d p2p_bcast_sta %d\n",
++					 !!p2p, !!(iwlmvm_mod_params.awdl_share & IWL_MVM_AWDL_SHARE_TX_P2P),
++					 p2p ? iwl_mvm_vif_from_mac80211(p2p)->roc_activity : -1,
++					 test_bit(IWL_MVM_STATUS_ROC_AUX_RUNNING, &mvm->status),
++					 test_bit(IWL_MVM_STATUS_ROC_P2P_RUNNING, &mvm->status),
++					 mvm->aux_queue, mvm->p2p_dev_queue,
++					 p2p ? iwl_mvm_vif_from_mac80211(p2p)->deflink.bcast_sta.sta_id : -1);
++			/* While the P2P Device is off on another channel (a
++			 * remain-on-channel there), send through it instead:
++			 * AWDL on that channel (experimental).
++			 */
++			/* With ROC_CMD v3 the P2P Device's remain-on-channel runs
++			 * on the aux station (ROC_ACTIVITY_P2P_DISC), so that's
++			 * what sends there.
++			 */
++			if (p2p && (iwlmvm_mod_params.awdl_share &
++				    IWL_MVM_AWDL_SHARE_TX_P2P)) {
++				struct iwl_mvm_vif *pv = iwl_mvm_vif_from_mac80211(p2p);
++
++				if (test_bit(IWL_MVM_STATUS_ROC_P2P_RUNNING,
++					     &mvm->status) &&
++				    mvm->p2p_dev_queue != IWL_MVM_INVALID_QUEUE &&
++				    pv->deflink.bcast_sta.sta_id != IWL_MVM_INVALID_STA) {
++					/* session protection on the P2P Device */
++					sta_id = pv->deflink.bcast_sta.sta_id;
++					queue = mvm->p2p_dev_queue;
++				} else if (pv->roc_activity < ROC_NUM_ACTIVITIES &&
++					   test_bit(IWL_MVM_STATUS_ROC_AUX_RUNNING,
++						    &mvm->status) &&
++					   mvm->aux_queue != IWL_MVM_INVALID_QUEUE) {
++					/* ROC_CMD on the aux station */
++					sta_id = mvm->aux_sta.sta_id;
++					queue = mvm->aux_queue;
++				}
++			}
++			if (sta_id == IWL_MVM_INVALID_STA ||
++			    queue == IWL_MVM_INVALID_QUEUE)
++				return -1;
+ 		} else if (info.control.vif->type ==
+ 			   NL80211_IFTYPE_P2P_DEVICE ||
+ 			   info.control.vif->type == NL80211_IFTYPE_AP ||
+@@ -1717,6 +1775,16 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
+ 
+ 	seq_ctl = le16_to_cpu(tx_resp->seq_ctl);
+ 
++	/* awdl_share: what became of what the monitor injected (rate limited) */
++	if (unlikely(READ_ONCE(mvm->awdl_share_vif)) &&
++	    (txq_id == mvm->snif_queue || txq_id == mvm->aux_queue ||
++	     txq_id == mvm->p2p_dev_queue))
++		IWL_ERR_LIMIT(mvm,
++			      "awdl_share: q%d tx status 0x%x tries %d rate 0x%x\n",
++			      txq_id, status,
++			      tx_resp->failure_frame,
++			      le32_to_cpu(tx_resp->initial_rate));
++
+ 	/* we can free until ssn % q.n_bd not inclusive */
+ 	iwl_trans_reclaim(mvm->trans, txq_id, ssn, &skbs, false);
+ 
+@@ -1730,6 +1798,17 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
+ 
+ 		iwl_trans_free_tx_cmd(mvm->trans, info->driver_data[1]);
+ 
++		/* awdl_share: unicast from the monitor, frame by frame */
++		if (unlikely(READ_ONCE(mvm->awdl_share_vif)) &&
++		    (txq_id == mvm->snif_queue || txq_id == mvm->aux_queue ||
++	     txq_id == mvm->p2p_dev_queue) &&
++		    !is_multicast_ether_addr(hdr->addr1))
++			IWL_INFO(mvm,
++				 "awdl_share: unicast q%d fc 0x%04x to %pM status 0x%x tries %d noack %d\n",
++				 txq_id, le16_to_cpu(hdr->frame_control), hdr->addr1,
++				 status, tx_resp->failure_frame,
++				 !!(info->flags & IEEE80211_TX_CTL_NO_ACK));
++
+ 		memset(&info->status, 0, sizeof(info->status));
+ 		info->flags &= ~(IEEE80211_TX_STAT_ACK | IEEE80211_TX_STAT_TX_FILTERED);
+ 

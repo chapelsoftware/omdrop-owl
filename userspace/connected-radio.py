@@ -17,6 +17,52 @@ RUN = Path('/run/omdrop-owl')
 NET = Path('/sys/class/net')
 OWNED = ('awdlgo0', 'mon0')
 GO_CARDS = {('0x8086', '0x51f0'), ('0x8086', '0x2725')}
+# /etc/omdrop/go-channel: the GO's channel, 6 by default. An iPhone keeps one
+# slot in sixteen on 6, and moves most of a transfer to 149 (44 outside the US).
+GO_FREQS = {6: 2437, 44: 5220, 149: 5745}
+
+
+def go_owl_flags():
+    """OWL's -F (fixed radio, unicast sent once with no ACK) unless
+    /etc/omdrop/go-fixed-radio says 0: the GO ACKs for us, so unicast can be
+    acknowledged and retried instead."""
+    try:
+        off = Path('/etc/omdrop/go-fixed-radio').read_text().split()[0] == '0'
+    except (OSError, IndexError):
+        off = False
+    return ['-E'] if off else ['-F', '-E']
+
+
+def go_stations():
+    """/etc/omdrop/go-stations = 1: make each AWDL peer a station of the GO,
+    so its ADDBA is answered and its A-MPDUs block-acked (needs the patched
+    iwlmvm, awdl_share 512). Unanswered, an iPhone sent single frames at
+    MCS 0."""
+    try:
+        return Path('/etc/omdrop/go-stations').read_text().split()[0] == '1'
+    except (OSError, IndexError):
+        return False
+
+
+PEER_LINE = re.compile(r'\b(add|remove) peer ([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})\b')
+
+
+def peer_commands(text):
+    """`add MAC` / `del MAC` lines for OWL's add/remove peer log lines; OWL
+    prints octets unpadded (ether_ntoa)."""
+    out = []
+    for op, addr in PEER_LINE.findall(text):
+        mac = ':'.join(f'{int(o, 16):02x}' for o in addr.split(':'))
+        out.append(f"{'add' if op == 'add' else 'del'} {mac}\n")
+    return ''.join(out)
+
+
+def go_channel():
+    try:
+        c = int(Path('/etc/omdrop/go-channel').read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 6
+    return c if c in GO_FREQS else 6
 stopping = False
 
 
@@ -34,8 +80,9 @@ def save(state):
     path.replace(RUN / 'go-state.json')
 
 
-def legal_channel(info):
-    rows = [r for r in info.splitlines() if re.search(r'\b2437(?:\.0+)? MHz \[6\]', r)]
+def legal_channel(info, chan=6):
+    freq = GO_FREQS[chan]
+    rows = [r for r in info.splitlines() if re.search(rf'\b{freq}(?:\.0+)? MHz \[{chan}\]', r)]
     return len(rows) == 1 and not any(flag in rows[0].lower() for flag in ('disabled', 'no ir', 'no-ir', 'radar'))
 
 
@@ -65,8 +112,8 @@ def preflight(station):
         if (NET / name).exists():
             raise RuntimeError(f'Interface {name} already exists; stop its owner first')
     info = command(['iw', 'phy', phy, 'info']).stdout
-    if not legal_channel(info):
-        raise RuntimeError('Channel 6 is not permitted for transmission here')
+    if not legal_channel(info, go_channel()):
+        raise RuntimeError(f'Channel {go_channel()} is not permitted for transmission here')
     if 'P2P-GO' not in info or not re.search(r'#channels <= [2-9]', info):
         raise RuntimeError('This driver does not advertise two-channel P2P GO concurrency')
     bssid = association(station)
@@ -129,16 +176,19 @@ def run(station):
     children = []
     reason, succeeded = 'stopped', False
 
-    def launch(args, filename, stdout=None):
+    def launch(args, filename, stdout=None, stdin=subprocess.DEVNULL):
         log = open(RUN / filename, 'a')
-        child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout or log, stderr=log)
+        child = subprocess.Popen(args, stdin=stdin, stdout=stdout or log, stderr=log)
         log.close()
         children.append(child)
         return child
 
     try:
-        helper = launch([str(LIB / 'awdl-go'), '--phy', state['phy'][3:], '--mac', state['mac']],
-                        'go.log', subprocess.PIPE)
+        chan = go_channel()
+        helper = launch([str(LIB / 'awdl-go'), '--phy', state['phy'][3:], '--mac', state['mac'],
+                         '--freq', str(GO_FREQS[chan])],
+                        'go.log', subprocess.PIPE,
+                        subprocess.PIPE if go_stations() else subprocess.DEVNULL)
         selector = selectors.DefaultSelector()
         selector.register(helper.stdout, selectors.EVENT_READ)
         if not selector.select(12):
@@ -152,7 +202,7 @@ def run(station):
         # Keep plain kernel IPv6 off the beaconing interface. IP belongs on TAP.
         command(['sysctl', '-qw', 'net.ipv6.conf.awdlgo0.disable_ipv6=1'])
         owl = launch([str(LIB / 'owl'), '-i', 'mon0', '-h', 'awdl0', '-m', state['mac'],
-                      '-N', '-c', '6', '-S', 'pin', '-F', '-E', '-v'], 'owl.log')
+                      '-N', '-c', str(chan), '-S', 'pin', *go_owl_flags(), '-v'], 'owl.log')
         (RUN / 'owl.pid').write_text(str(owl.pid))
         (RUN / 'supervisor.pid').write_text(str(os.getpid()))
         until_ready = time.monotonic() + 12
@@ -173,7 +223,16 @@ def run(station):
         (RUN / 'go-ready').write_text('ready\n')
         (RUN / 'reason').write_text('')
         misses, burst, next_burst = 0, None, 0
+        owl_log = open(RUN / 'owl.log', 'r', errors='replace') if go_stations() else None
         while not stopping:
+            if owl_log is not None:
+                lines = peer_commands(owl_log.read())
+                if lines:
+                    try:
+                        helper.stdin.write(lines.encode())
+                        helper.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        raise RuntimeError('GO helper stopped taking stations')
             until = int((RUN / 'until').read_text().strip())
             if until and time.time() >= until:
                 reason = 'expired'

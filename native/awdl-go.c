@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <linux/nl80211.h>
 #include <net/if.h>
+#include <poll.h>
 #include <netlink/genl/ctrl.h>
 #include <netlink/genl/genl.h>
 #include <netlink/msg.h>
@@ -24,6 +25,10 @@ static const char ssid[] = "DIRECT-omdrop";
 static struct nl_sock *sk;
 static int family;
 static unsigned go_id, mon_id, phy_id;
+/* --freq: the GO's channel. 2437 (6) by default; 5745 (149) is where an
+ * iPhone spends most of a transfer. */
+static unsigned freq = 2437;
+static uint8_t chan_num(void) { return freq == 2484 ? 14 : freq < 5000 ? (freq - 2407) / 5 : (freq - 5000) / 5; }
 static volatile sig_atomic_t stopping;
 static void stop(int n) { (void)n; stopping = 1; }
 static struct nl_msg *message(int cmd, unsigned id) {
@@ -67,14 +72,14 @@ static size_t beacon(uint8_t *b) {
     memcpy(b+n,ssid,sizeof(ssid)-1); n+=sizeof(ssid)-1;
     const uint8_t rates[]={1,8,0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
     memcpy(b+n,rates,sizeof(rates)); n+=sizeof(rates);
-    b[n++]=3; b[n++]=1; b[n++]=6;
+    b[n++]=3; b[n++]=1; b[n++]=chan_num();
     return n;
 }
 static size_t tail(uint8_t *b) {
     size_t n=0;
     b[n++]=45; b[n++]=26; memset(b+n,0,26);
     b[n+2]=0x1b; b[n+3]=0xff; n+=26; /* one-stream HT20, conservative caps */
-    b[n++]=61; b[n++]=22; memset(b+n,0,22); b[n]=6; n+=22;
+    b[n++]=61; b[n++]=22; memset(b+n,0,22); b[n]=chan_num(); n+=22;
     const uint8_t p2p[]={221,18,0x50,0x6f,0x9a,9,2,2,0,0,1,3,6,0,2,0x25,0,0xaa,0,1};
     memcpy(b+n,p2p,sizeof(p2p)); memcpy(b+n+14,mac,6); n+=sizeof(p2p); return n;
 }
@@ -82,9 +87,9 @@ static int start_ap(void) {
     uint8_t head[256], rest[128]; size_t hn=beacon(head),tn=tail(rest);
     const uint8_t basic[]={12,24,48};
     struct nl_msg *m=message(NL80211_CMD_START_AP,go_id);
-    if (nla_put_u32(m,NL80211_ATTR_WIPHY_FREQ,2437) ||
+    if (nla_put_u32(m,NL80211_ATTR_WIPHY_FREQ,freq) ||
         nla_put_u32(m,NL80211_ATTR_CHANNEL_WIDTH,NL80211_CHAN_WIDTH_20) ||
-        nla_put_u32(m,NL80211_ATTR_CENTER_FREQ1,2437) ||
+        nla_put_u32(m,NL80211_ATTR_CENTER_FREQ1,freq) ||
         nla_put_u32(m,NL80211_ATTR_BEACON_INTERVAL,100) ||
         nla_put_u32(m,NL80211_ATTR_DTIM_PERIOD,2) ||
         nla_put(m,NL80211_ATTR_SSID,sizeof(ssid)-1,ssid) ||
@@ -95,6 +100,61 @@ static int start_ap(void) {
         nla_put(m,NL80211_ATTR_BEACON_HEAD,hn,head) ||
         nla_put(m,NL80211_ATTR_BEACON_TAIL,tn,rest)) abort();
     return submit(m);
+}
+/* AWDL peers as stations of the GO (`add MAC` / `del MAC` on stdin), so
+ * mac80211 answers their ADDBA and the firmware block-acks their A-MPDUs:
+ * unanswered, an iPhone sent one frame at a time at MCS 0 (~130 kB/s). The
+ * patched iwlmvm (awdl_share 512) gives their block-ack frames the GO's
+ * BSSID on the way in and AWDL's on the way out. */
+static uint16_t next_aid = 1;
+static int parse_mac(const char *t, uint8_t *m) {
+    unsigned v[6]; char extra;
+    if (sscanf(t,"%2x:%2x:%2x:%2x:%2x:%2x%c",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&extra)!=6) return -1;
+    for (int j=0;j<6;j++) m[j]=(uint8_t)v[j];
+    return 0;
+}
+static int station(const char *line) {
+    char op[8], who[32]; uint8_t m[6];
+    if (sscanf(line,"%7s %31s",op,who)!=2 || parse_mac(who,m)) return -1;
+    if (!strcmp(op,"del")) {
+        struct nl_msg *d=message(NL80211_CMD_DEL_STATION,go_id);
+        if (nla_put(d,NL80211_ATTR_MAC,6,m)) abort();
+        return submit(d);
+    }
+    if (strcmp(op,"add")) return -1;
+    /* OFDM rates; HT: SGI20, 64 KiB A-MPDU, MCS 0-15. */
+    const uint8_t rates[]={12,18,24,36,48,72,96,108};
+    uint8_t ht[26]={0};
+    ht[0]=0x20; ht[2]=0x1b; ht[3]=0xff; ht[4]=0xff;
+    struct nl80211_sta_flag_update f={
+        .mask=(1u<<NL80211_STA_FLAG_AUTHORIZED)|(1u<<NL80211_STA_FLAG_WME),
+        .set=(1u<<NL80211_STA_FLAG_AUTHORIZED)|(1u<<NL80211_STA_FLAG_WME)};
+    struct nl_msg *a=message(NL80211_CMD_NEW_STATION,go_id);
+    if (nla_put(a,NL80211_ATTR_MAC,6,m) ||
+        nla_put(a,NL80211_ATTR_STA_SUPPORTED_RATES,sizeof(rates),rates) ||
+        nla_put_u16(a,NL80211_ATTR_STA_LISTEN_INTERVAL,1) ||
+        nla_put_u16(a,NL80211_ATTR_STA_AID,next_aid) ||
+        nla_put(a,NL80211_ATTR_HT_CAPABILITY,sizeof(ht),ht) ||
+        nla_put(a,NL80211_ATTR_STA_FLAGS2,sizeof(f),&f)) abort();
+    int e=submit(a);
+    if (e>=0) next_aid = next_aid >= 2007 ? 1 : next_aid + 1;
+    return e;
+}
+static int stations(void) {  /* -1 once stdin is closed */
+    static char buf[256]; static size_t have;
+    ssize_t r=read(0,buf+have,sizeof(buf)-1-have);
+    if (r==0) return -1;
+    if (r<0) return 0;
+    have+=(size_t)r; buf[have]=0;
+    char *nl;
+    while ((nl=strchr(buf,'\n'))) {
+        *nl=0;
+        int e=station(buf);
+        fprintf(stderr,"station %s %s\n", e<0 ? "FAIL" : "OK", buf);
+        have-=(size_t)(nl+1-buf); memmove(buf,nl+1,have+1);
+    }
+    if (have>=sizeof(buf)-1) have=0;
+    return 0;
 }
 static void remove_owned(const char *name,unsigned id) {
     if (!id || if_nametoindex(name)!=id) return;
@@ -129,7 +189,11 @@ int main(int argc,char **argv) {
                strlen(argv[i])!=17 || (v[0]&3)!=2) return 2;
             for(int j=0;j<6;j++) mac[j]=(uint8_t)v[j];
             have_mac=1;
-        } else { fprintf(stderr,"usage: %s --phy INDEX --mac LOCAL_MAC | --self-test\n",argv[0]); return 2; }
+        } else if(!strcmp(argv[i],"--freq")&&i+1<argc) {
+            char *end; long f=strtol(argv[++i],&end,10);
+            if(*end || !((f>=2412&&f<=2484)||(f>=5180&&f<=5885))) return 2;
+            freq=(unsigned)f;
+        } else { fprintf(stderr,"usage: %s --phy INDEX --mac LOCAL_MAC [--freq MHZ] | --self-test\n",argv[0]); return 2; }
     }
     if(!have_phy||!have_mac) return 2;
     if(geteuid()) { fprintf(stderr,"requires root\n"); return 1; }
@@ -145,7 +209,14 @@ int main(int argc,char **argv) {
     if(start_ap()<0||stopping) goto out;
     if(create("mon0",NL80211_IFTYPE_MONITOR,&mon_id)<0||stopping) goto out;
     printf("READY go=%u monitor=%u\n",go_id,mon_id); fflush(stdout);
-    while(!stopping) { struct timespec delay={1,0}; nanosleep(&delay,NULL); }
+    int input=1;
+    while(!stopping) {
+        struct pollfd p={.fd=0,.events=POLLIN};
+        if (!input) { struct timespec delay={1,0}; nanosleep(&delay,NULL); continue; }
+        int n=poll(&p,1,1000);
+        if (n>0 && (p.revents&(POLLIN|POLLHUP)) && stations()<0) input=0;
+        else if (n>0 && (p.revents&(POLLERR|POLLNVAL))) input=0;
+    }
     result=0;
 out:
     remove_owned("mon0",mon_id);
