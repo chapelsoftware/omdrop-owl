@@ -50,6 +50,11 @@ PROFILES=$LIB/owl-profiles
 # 0x88 (OpenDrop's: SUPPORTS_MIXED_TYPES | SUPPORTS_DISCOVER_MAYBE) + SUPPORTS_URL.
 ADV_FLAGS=137
 ADV_INTERVAL=3
+# iwlmvm's awdl_share bitmask (patched driver only): 2, other BSSs' management
+# frames, which carry AWDL's action frames; 4, injection through the station.
+# Not 1, promiscuous data: the AX210's station loses its AP's beacons.
+AWDL_SHARE=/sys/module/iwlmvm/parameters/awdl_share
+AWDL_SHARE_ON=6
 # One round of announcements. Three copies do in shared mode, where OWL sends
 # them in AWDL's multicast slots and the phone is on our channel for those. In
 # exclusive mode it visits our channel for a slot or two in sixteen, and OWL
@@ -108,6 +113,20 @@ load_profile() {  # DRIVER
   [ -n "$line" ] || line=$(awk '!/^#/ && NF >= 6 && $1 == "*" {print; exit}' "${tables[@]}")
   [ -n "$line" ] || return 1
   read -r _ PROF_STATUS PROF_MODE PROF_MONMAC PROF_RECONNECT PROF_PM _ <<< "$line"
+  # iwlmvm with kernel/iwlmvm-awdl-share-*.patch can inject and hear AWDL
+  # beside the station, so an Intel card runs shared when that's loaded.
+  if [ "$1" = iwlwifi ] && [ -w "$AWDL_SHARE" ]; then
+    PROF_STATUS=tested PROF_MODE=shared PROF_MONMAC=station PROF_RECONNECT=no PROF_PM=no
+  fi
+}
+
+# Channel number of a 2.4 or 5 GHz frequency, else nothing.
+freq_chan() {  # MHz
+  case "$1" in
+    2484) echo 14 ;;
+    24[0-9][0-9]) echo $(( ($1 - 2407) / 5 )) ;;
+    5[0-8][0-9][0-9]) echo $(( ($1 - 5000) / 5 )) ;;
+  esac
 }
 
 untested_hint() {
@@ -290,10 +309,13 @@ cmd_probe() {
     [ -x "$OWL_BIN" ] || missing+=("backend|omdrop-owl is installed without OWL ($OWL_BIN). Reinstall omdrop-owl.")
     [ "$PROF_MODE" = shared ] || [ "$PROF_MODE" = exclusive ] || missing+=("backend|This Wi-Fi card's profile asks for \"$PROF_MODE\" mode, which omdrop-owl doesn't implement yet.")
     ap=$(iw dev "$sta" link 2>/dev/null | awk '/freq:/ {print int($2)}')
+    # An iPhone puts its own Wi-Fi network's channel in its AWDL sequence
+    # (36 in 8 slots of 16, measured 2026-10-12), so any 2.4 or 5 GHz channel
+    # does when the phone is on the same network; elsewhere, 6, 44 or 149.
     case "$PROF_MODE:$ap" in
-      exclusive:*|*:2437|*:5220|*:5745) ;;
+      exclusive:*) ;;
       *:) missing+=("radio|Wi-Fi isn't connected, and AirDrop shares its channel. Connect to Wi-Fi first.") ;;
-      *) missing+=("radio|Your Wi-Fi network is on $ap MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work.") ;;
+      *) [ -n "$(freq_chan "$ap")" ] || missing+=("radio|Your Wi-Fi network is on $ap MHz, which AirDrop can't share. Use a 2.4 or 5 GHz network.") ;;
     esac
   fi
   [ "${1:-}" = --json ] || { printf '%s\n' "${missing[@]:-ready}"; return 0; }
@@ -320,6 +342,10 @@ cmd_stop() {
   pkill -f "^$OWL_BIN " 2>/dev/null
   ip link set "$MON" down 2>/dev/null
   iw dev "$MON" del 2>/dev/null
+  if [ -e "$RUN/awdl_share" ]; then
+    echo 0 > "$AWDL_SHARE" 2>/dev/null
+    rm -f "$RUN/awdl_share"
+  fi
   exclusive_down || log "could not make $(cat "$RUN/exclusive") a station again; start will retry"
   sta=$(cat "$RUN/station" 2>/dev/null)
   pm=$(cat "$RUN/pm" 2>/dev/null)
@@ -425,10 +451,14 @@ cmd_start() {
     [ -n "$gw" ] || die "Wi-Fi isn't connected (or isn't passing traffic), and AirDrop shares its channel. Connect to Wi-Fi and try again." 3
     ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
   fi
-  case "$ap" in
-    2437) chan=6 ;; 5220) chan=44 ;; 5745) chan=149 ;;
-    *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
-  esac
+  # Shared: any 2.4 or 5 GHz channel, see cmd_probe. Exclusive starts its
+  # cell on one of AWDL's own.
+  chan=$(freq_chan "${ap:-0}")
+  [ -n "$chan" ] || die "your Wi-Fi network is on ${ap:-an unknown} MHz, which AirDrop can't share. Use a 2.4 or 5 GHz network." 3
+  if [ "$PROF_MODE" = shared ] && [ -w "$AWDL_SHARE" ] && [ "$drv" = iwlwifi ]; then
+    echo "$AWDL_SHARE_ON" > "$AWDL_SHARE"
+    echo 1 > "$RUN/awdl_share"
+  fi
   stamac=$(cat "/sys/class/net/$sta/address")
   echo "$sta" > "$RUN/station"
   echo "$drv $PROF_MODE $PROF_MONMAC $PROF_RECONNECT $PROF_PM" > "$RUN/profile"
